@@ -265,6 +265,10 @@ async function doSign() {
   render();
 
   try {
+    // Sign on a fresh dedicated session. Signing on a session that has been
+    // through the init/edit flow is silently ignored by the server — same
+    // workaround as signTimesheet() in server.js.
+    await releaseClient();
     await withClient(async (cp) => {
       await cp.sign();
       storeWeekData(cp.getData());

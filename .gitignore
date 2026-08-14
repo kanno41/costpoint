@@ -1,5 +1,11 @@
 .vscode/
 
+# Puppeteer-downloaded Chrome binary
+chrome/
+
+# Captured protocol traffic (contains real timesheet/employee data)
+captured/
+
 # Created by https://www.gitignore.io/api/node
 
 ### Node ###

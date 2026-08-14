@@ -23,7 +23,10 @@ const PARENT_COL = {
   END_DT: 3,
   S_STATUS_CD: 4,
   ENABLE_SIGN_FL: 565,
-  ACTION_CD: 667,
+  // Column the browser sets to 'S' when signing (verified byte-for-byte
+  // against captured/sign-capture/017+018; col 667 was wrong — the server
+  // silently ignores it)
+  ACTION_CD: 23,
 };
 
 // Child column indices
@@ -812,9 +815,241 @@ class DirectClient {
     }
   }
 
+  /**
+   * Sign the timesheet.
+   *
+   * Mirrors the browser's two-request flow (captured/sign-capture/017+018):
+   *   1. CMD 300 TMMTS_SIGN_TIMESHEET action, batched with parent PUTs that
+   *      carry ACTION_CD='S'. This primes the server-side sign transition —
+   *      without it the server silently ignores ACTION_CD='S' on save (the
+   *      request round-trips cleanly but the timesheet stays unsigned).
+   *   2. PUT K0 + CMD 206 SAVE (what the browser sends after the user
+   *      confirms the sign dialog) — reuses save().
+   */
   async sign() {
+    debug('Signing timesheet...');
+
+    // Step 1: fire the sign action event
+    const respText = await this._postServlet(this._buildSignEvent());
+    if (respText.includes('onServletException')) {
+      throw new Error('Server error during sign action. Please try again.');
+    }
+    const parsed = protocol.parseResponse(respText);
+    const err = protocol.checkErrors(parsed);
+    if (protocol.checkRescds(parsed) || err) {
+      throw new Error('Sign error: ' + (err || 'server rejected the sign action'));
+    }
+
+    // Refresh local data — the server returns the parent row with
+    // ACTION_CD='S' already applied
+    const k0Data = protocol.extract204(parsed, 0);
+    const k1Data = protocol.extract204(parsed, 1);
+    if (k0Data) this.parentData = k0Data;
+    if (k1Data) this.childData = k1Data;
+
+    // Step 2: confirm — browser-exact batch (capture 018): PUT K0 only with
+    // editFlag 18 + CMD 206. Deliberately NOT save()/_buildSaveBatch, whose
+    // shape diverges from the browser (editFlag 65562, all K1 rows PUT) and
+    // is the prime suspect for the session state that gets signs ignored.
     this.parentData.rows[0][PARENT_COL.ACTION_CD] = 'S';
-    await this.save();
+    const confirmResp = await this._postServlet(this._buildSignConfirmBatch());
+    if (confirmResp.includes('onServletException')) {
+      throw new Error('Server error during sign confirm. Please try again.');
+    }
+    const confirmParsed = protocol.parseResponse(confirmResp);
+    const confirmErr = protocol.checkErrors(confirmParsed);
+    if (protocol.checkRescds(confirmParsed) || confirmErr) {
+      throw new Error('Sign confirm error: ' + (confirmErr || 'server rejected the sign save'));
+    }
+    const ck0 = protocol.extract204(confirmParsed, 0);
+    const ck1 = protocol.extract204(confirmParsed, 1);
+    if (ck0) this.parentData = ck0;
+    if (ck1) this.childData = ck1;
+
+    // The sign-confirm save returns no 204 data (unlike normal saves), so
+    // save()'s refresh is a no-op and local state still shows unsigned.
+    // Re-fetch explicitly so callers (and the web UI cache) see the new status.
+    const refreshResp = await this._postServlet(protocol.buildRequestBody(this.sid, [
+      ...this._get204(0),
+      ...this._get204(1),
+      this._keepalive(),
+    ]));
+    const refreshParsed = protocol.parseResponse(refreshResp);
+    const freshK0 = protocol.extract204(refreshParsed, 0);
+    const freshK1 = protocol.extract204(refreshParsed, 1);
+    if (freshK0) this.parentData = freshK0;
+    if (freshK1) this.childData = freshK1;
+    this._buildTableRows();
+
+    const status = this.parentData.rows[0][PARENT_COL.S_STATUS_CD];
+    if (status !== 'S') {
+      throw new Error('Sign did not take effect (status is still "' + status + '")');
+    }
+    debug('Timesheet signed.');
+  }
+
+  /**
+   * Build the CMD 300 TMMTS_SIGN_TIMESHEET batch (browser capture 017):
+   * PUT K0 selected-flag (pre-sign state, editFlag 64), PUT K0 with
+   * ACTION_CD='S' (editFlag 82), PUT K0 context-only (editFlag 82),
+   * PUT K1 row 0 (editFlag 0), then the 300 action + 204 refresh + keepalive.
+   */
+  _buildSignEvent() {
+    const parentRow = this.parentData.rows[0];
+    const parentRowNum = this.parentData.rowNums[0];
+
+    // Frame 1 sends the parent as-is; frames 2-3 send it with ACTION_CD='S'
+    const encodedParentPlain = protocol.encodePutRow(parentRow);
+    parentRow[PARENT_COL.ACTION_CD] = 'S';
+    const encodedParentSigned = protocol.encodePutRow(parentRow);
+
+    this._signActionSeq = (this._signActionSeq || 0) + 1;
+
+    const cmds = [
+      // PUT K0 selected row flag only (editFlag 64)
+      this._wrap(this._cmd(205, [
+        { name: 'rsRowSelectedFlOnly', value: 'true' },
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+      ]), {
+        data: encodedParentPlain + protocol.DLM_ROW,
+        editFlag: '64,',
+        rowNumber: parentRowNum + ',',
+      }),
+      // PUT K0 with ACTION_CD='S' (editFlag 82)
+      this._wrap(this._cmd(205, [
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedParentSigned + protocol.DLM_ROW,
+        editFlag: '82,',
+        rowNumber: parentRowNum + ',',
+      }),
+      // PUT K0 context only (editFlag 82)
+      this._wrap(this._cmd(205, [
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedParentSigned + protocol.DLM_ROW,
+        editFlag: '82,',
+        rowNumber: parentRowNum + ',',
+      }),
+    ];
+
+    // PUT K1 row 0 context (editFlag 0) — skipped if there are no charge rows
+    if (this.childData && this.childData.rows.length > 0) {
+      cmds.push(this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' },
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '1' }, { code: 'C', value: '0' },
+        { code: 'P', value: '0' }, { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: protocol.encodePutRow(this.childData.rows[0]) + protocol.DLM_ROW,
+        editFlag: '0,',
+        rowNumber: this.childData.rowNums[0] + ',',
+      }));
+    }
+
+    cmds.push(
+      // CMD 300 TMMTS_SIGN_TIMESHEET (report params match the browser)
+      this._wrap(this._cmd(300, [
+        { name: 'rptPrintAllPages', value: 'Y' },
+        { name: 'rptInclCoverPage', value: 'Y' },
+        { name: 'printRpt', value: 'N' },
+        { name: 'rptScalingFactor', value: 'DFLT' },
+        { name: 'rptPrnNofC', value: '1' },
+        { name: 'downloadRpt', value: 'Y' },
+        { name: 'emailRpt', value: 'N' },
+        { name: 'printToFileRpt', value: 'N' },
+        { name: 'rptLocale', value: 'VIEW_AS_BUILT' },
+        { name: 'runAfterRptFl', value: 'Y' },
+        { name: 'archiveRpt', value: 'N' },
+        { name: 'rptArchRelativeAbsDt', value: 'Y' },
+        { name: 'rptArchNeverDelete', value: 'Y' },
+        { name: 'syncRequest', value: 'true' },
+        { name: 'rptFormat', value: 'pdf' },
+        { name: 'printLocalRpt', value: 'N' },
+        { name: 'printSendEmail1', value: 'N' },
+        { name: 'printHomePage1', value: 'N' },
+        { name: 'printPopupAlert1', value: 'N' },
+        { name: 'printSendEmail2', value: 'N' },
+        { name: 'printHomePage2', value: 'N' },
+        { name: 'printPopupAlert2', value: 'N' },
+        { name: 'printSendEmail3', value: 'N' },
+        { name: 'printHomePage3', value: 'N' },
+        { name: 'printPopupAlert3', value: 'N' },
+        { name: 'printSendEmail4', value: 'N' },
+        { name: 'printHomePage4', value: 'N' },
+        { name: 'printPopupAlert4', value: 'N' },
+        { name: 'rptEmailAttachmentCount', value: '0' },
+        { name: 'actionId', value: 'TMMTS_SIGN_TIMESHEET' },
+        { name: 'restartFl', value: 'false' },
+        { code: 'C', value: '0' },
+        { name: 'longRunActionFl', value: '0' },
+        { name: 'procUniqueId', value: APP_ID + ':A:' + this.sid + ':' + this._signActionSeq },
+        { name: 'psSchWorkflowNotifyFl', value: 'false' },
+        { code: 'K', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      ...this._get204(0),
+      ...this._get204(1),
+      this._keepalive(),
+    );
+
+    // reqIdx=1 accompanies CMD 300 action requests (matches browser capture)
+    return protocol.buildRequestBody(this.sid, cmds) + '&reqIdx=1';
+  }
+
+  /**
+   * Build the sign-confirm batch (browser capture 018): PUT K0 with
+   * editFlag 18 (parent row carries ACTION_CD='S'), CMD 206 SAVE, then 204
+   * refreshes including the R=S&C status/count fetches the browser sends
+   * after saves. No K1 PUT — the browser does not send one here.
+   */
+  _buildSignConfirmBatch() {
+    const parentRow = this.parentData.rows[0];
+    const parentRowNum = this.parentData.rowNums[0];
+    const childRowCount = this.childData ? this.childData.rows.length : 40;
+    const k1E = Math.max(childRowCount + 5, 40);
+
+    const cmds = [
+      this._wrap(this._cmd(205, [
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: protocol.encodePutRow(parentRow) + protocol.DLM_ROW,
+        editFlag: '18,',
+        rowNumber: parentRowNum + ',',
+      }),
+      this._wrap(this._cmd(206, [
+        { code: 'G', value: 'false' }, { code: 'C', value: '0' },
+        { code: 'U', value: 'true' }, { code: 'K', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      ...this._get204(0),
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'S&C' },
+        { code: 'S', value: '0' }, { code: 'E', value: '20' },
+        { code: 'W', value: '' },
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      ...this._get204(1),
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'S&C' },
+        { code: 'S', value: '0' }, { code: 'E', value: String(k1E) },
+        { code: 'X', value: '0' }, { code: 'W', value: '' },
+        { code: 'K', value: '1' }, { code: 'C', value: '0' },
+        { code: 'P', value: '0' }, { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
   }
 
   /**
